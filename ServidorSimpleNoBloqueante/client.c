@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -26,6 +27,11 @@
 #define F_FAILURE       -1
 #define F_SUCCESS       0
 
+// WR stands for wait_receive (first words of a function below)
+#define WR_SUCCESS      0
+#define WR_FAILURE      -1
+#define WR_NTR          -2  // NTR stands for Nothing To Read
+
 
 // Socket file descriptor for client
 int cli_sfd;
@@ -36,12 +42,12 @@ void
 handle_sigint(int sig)
 {
     printf("\nSocket shutdown received (CTRL+C)...\n");
-    close(cli_sfd); // Close client socket
+    close(cli_sfd); // Close server socket
     
     exit(EXIT_SUCCESS);
 }
 
-//-- Prints the proper error msg and terminates with failure
+//-- Prints an error message along the perror information and ends the execution
 void 
 perror_exit(char *msg, int socket_running)
 {
@@ -58,7 +64,7 @@ perror_exit(char *msg, int socket_running)
 //-- Calls perror_exit with SOCKET_RUNNING as second parameter
 #define perror_exit_sr(msg) perror_exit(msg, SOCKET_RUNNING)
 
-//-- Sets up the client socket configuration
+//-- Function to set up the server socket
 int 
 init_client_socket(struct sockaddr_in *servaddr)
 {
@@ -69,7 +75,7 @@ init_client_socket(struct sockaddr_in *servaddr)
     printf("Socket successfully created...\n");
 
     servaddr->sin_family = AF_INET;
-    servaddr->sin_addr.s_addr = htonl("212.128.255.24");  // # INADDR_ANY is 0.0.0.0 (all interfaces)
+    servaddr->sin_addr.s_addr = htonl(INADDR_ANY);  // INADDR_ANY = 0.0.0.0
     servaddr->sin_port = htons(PORT);
 
     return cli_sfd;
@@ -120,17 +126,59 @@ send_msg(int conn_fd, char *buff, size_t buffsize)
     return F_SUCCESS;
 }
 
-//-- Communication loop between client and server [this: client]
+//-- Wait with select() for the client file descriptor without "busy waiting"
+int
+wait_recv_timeout(fd_set *readmask, struct timeval *timeout)
+{
+    int result = select(cli_sfd + 1, readmask, NULL, NULL, timeout);
+
+    DEBUG_PRINTF("Select clear, result returned: %i\n", result);
+
+    if (result == -1) {
+        perror("select() failed");
+        return WR_FAILURE;
+    }
+
+    // There IS data to read from the file descriptor
+    if (FD_ISSET(cli_sfd, readmask)) {
+        DEBUG_PRINTF(" `--> call recv()\n");
+        return WR_SUCCESS;
+    }
+
+    // Timeout: no data found
+    DEBUG_PRINTF(" `--> continue;\n");
+    return WR_NTR;
+}
+
+//-- Communication loop between client and server [HERE: client]
 int
 connection_dialogue(void)
 {
     char conn_buffer[1024];
-    int recv_status, exit_status = EXIT_FAILURE, talking = 1;
+    int wait_recv_status, recv_status, exit_status = EXIT_FAILURE, talking = 1;
+
+    fd_set readmask;
+    struct timeval timeout_base;        // timeout to set each iteration
+    struct timeval timer;               // timer the wait_recv..() function uses
+
+    timeout_base.tv_sec     = 0;             // seconds
+    timeout_base.tv_usec    = 500000;       // microseconds (0.5s = 500000)
 
     while (talking) {
+        
+        send_msg(cli_sfd, conn_buffer, sizeof(conn_buffer));
 
-        if (send_msg(cli_sfd, conn_buffer, sizeof(conn_buffer)) < 0) {
-            talking = 0;
+        // do always before wait_recv (!)
+        FD_ZERO(&readmask);             // Reset all deescriptors
+        FD_SET(cli_sfd, &readmask);     // Asign client descriptor
+        timer = timeout_base;
+
+        wait_recv_status = wait_recv_timeout(&readmask, &timer);
+        if (wait_recv_status < 0) {
+            // If wait_recv_...() returned with FAILURE, end the talking loop
+            if (wait_recv_status == WR_FAILURE) {
+                talking = 0;
+            }
             continue;
         }
 
@@ -149,8 +197,8 @@ connection_dialogue(void)
 int
 main(int argc, char *argv[])
 {
-    struct sockaddr_in servaddr;
     int conn_exit_status;
+    struct sockaddr_in servaddr;
 
     // Disable buffering when printing messages
     setbuf(stdout, NULL);

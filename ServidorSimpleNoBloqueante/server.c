@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -25,6 +26,11 @@
 
 #define F_FAILURE       -1
 #define F_SUCCESS       0
+
+// WR stands for wait_receive (first words of a function below)
+#define WR_SUCCESS      0
+#define WR_FAILURE      -1
+#define WR_NTR          -2  // NTR stands for Nothing To Read
 
 
 // Socket file descriptor for server
@@ -78,7 +84,7 @@ init_server_socket(struct sockaddr_in *servaddr)
     }
 
     printf("Socket successfully created...\n");
-    return F_SUCCESS;
+    return serv_sfd;
 }
 
 //-- Bind and listen on the server socket
@@ -104,7 +110,7 @@ receive_msg(int conn_fd, char *buff, size_t buffsize)
 
     // clear buffer and block until receiving a msg
     memset(buff, 0, buffsize);
-    int bytes_received = recv(conn_fd, buff, buffsize, 0);
+    int bytes_received = recv(conn_fd, buff, buffsize, MSG_DONTWAIT);
     
     if (bytes_received < 0) {
         perror("recv failed");
@@ -135,23 +141,93 @@ send_msg(int conn_fd, char *buff, size_t buffsize)
     return F_SUCCESS;
 }
 
-//-- Communication loop between client and server [this: server]
+//-- Wait with select() for the client file descriptor without "busy waiting"
+int
+wait_recv_timeout(int conn_fd, fd_set *readmask, struct timeval *timeout)
+{
+    int select_result;
+
+    DEBUG_PRINTF("Beggining of wait_recv_timeout() function...\n");
+    select_result = select(conn_fd + 1, readmask, NULL, NULL, timeout);
+
+    if (select_result == F_FAILURE) {
+        perror("select() failed");
+        return WR_FAILURE;
+    }
+
+    // There IS data to read from the file descriptor
+    if (FD_ISSET(conn_fd, readmask)) {
+        DEBUG_PRINTF(" `--> call recv()\n");
+        return WR_SUCCESS;
+    }
+
+    // Timeout: no data found
+    DEBUG_PRINTF(" `--> continue;\n");
+    return WR_NTR;
+}
+
+//-- Returns a status after receiving n bytes (with n being: int bytes_received)
+int
+process_bytes_received(int bytes_received)
+{
+    if (bytes_received < 0) {
+        perror("recv failed");
+        return WR_FAILURE;
+    }
+
+    // In case the client receives a 0 byte msg, it means the server closed
+    if (bytes_received == 0) {
+        printf("Server closed the connection\n");
+        return WR_FAILURE;
+    }
+
+    return WR_SUCCESS;
+}
+
+//-- Communication loop between client and server [HERE: server]
 void
 connection_dialogue(int conn_fd)
 {
     char conn_buffer[1024];
-    int talking = 1;
+    int wait_recv_status, can_send = 0, talking = 1;
+
+    fd_set readmask;
+    struct timeval timeout_base;        // timeout to set each iteration
+    struct timeval timer;               // timer the wait_recv..() function uses
+
+    timeout_base.tv_sec     = 15;           // seconds (15 s wait)
+    timeout_base.tv_usec    = 0;            // microseconds
 
     while (talking) {
+
+        // First time, can_send is always 0 so the server starts receiving
+        if(can_send) {
+            if(send_msg(conn_fd, conn_buffer, sizeof(conn_buffer)) < 0) {
+                talking = 0;
+                continue;
+            }
+        }
+
+        // do always before wait_recv (!)
+        FD_ZERO(&readmask);                 // Reset all deescriptors
+        FD_SET(conn_fd, &readmask);         // Asign client descriptor
+        timer = timeout_base;
+
+        wait_recv_status = wait_recv_timeout(conn_fd, &readmask, &timer);
+        if (wait_recv_status < 0) {
+            can_send = 1;
+            // If wait_recv_...() returned with FAILURE, end the talking loop
+            if (wait_recv_status == WR_FAILURE) {
+                talking = 0;
+            }
+            continue;
+        }
         
         if (receive_msg(conn_fd, conn_buffer, sizeof(conn_buffer)) < 0) {
             talking = 0;
-            continue;
         }
 
-        if (send_msg(conn_fd, conn_buffer, sizeof(conn_buffer)) < 0) {
-            talking = 0;
-        }
+        can_send = 1;
     }
 }
 
@@ -180,12 +256,11 @@ main(int argc, char *argv[])
     // Signal managenent
     signal(SIGINT, handle_sigint);
 
-    // send and receive loop
+    // Communication (loop) : starts receiving
     connection_dialogue(conn_fd);
 
-    // if the function above ends, an error occurred
     close(conn_fd);
     close(serv_sfd);
 
-    exit(EXIT_FAILURE);
+    exit(EXIT_SUCCESS);
 }

@@ -11,22 +11,29 @@
 #include <err.h>
 #include <errno.h>
 
+
 #ifdef DEBUG
     #define DEBUG_PRINTF(...) printf("DEBUG: "__VA_ARGS__)
 #else
     #define DEBUG_PRINTF(...)
 #endif
 
-#define PORT            8073
+
 #define SOCKET_RUNNING  1
 #define SOCKET_CLOSED   0
 
-#define RECV_DOAGAIN    2
-#define RECV_BREAK      1
-#define RECV_SUCCESS    0
+#define F_FAILURE       -1
+#define F_SUCCESS       0
+
+// WR stands for wait_receive (first words of a function below)
+#define WR_SUCCESS      0
+#define WR_FAILURE      -1
+#define WR_NTR          -2  // NTR stands for Nothing To Read
+
 
 // Socket file descriptor for client
 int cli_sfd;
+
 
 //-- Handles SIGINT signals so the CLIENT can be stopped with CTRL+C
 void 
@@ -52,11 +59,12 @@ perror_exit(char *msg, int socket_running)
     exit(EXIT_FAILURE);
 }
 
+//-- Calls perror_exit with SOCKET_RUNNING as second parameter
 #define perror_exit_sr(msg) perror_exit(msg, SOCKET_RUNNING)
 
 //-- Function to set up the server socket
 int 
-init_client_socket(struct sockaddr_in *servaddr)
+init_client_socket(struct sockaddr_in *servaddr, char *serv_ip, int serv_port)
 {
     cli_sfd = socket(AF_INET, SOCK_STREAM, 0);
     if (cli_sfd < 0) {
@@ -65,10 +73,55 @@ init_client_socket(struct sockaddr_in *servaddr)
     printf("Socket successfully created...\n");
 
     servaddr->sin_family = AF_INET;
-    servaddr->sin_addr.s_addr = htonl(INADDR_ANY);  // INADDR_ANY = 0.0.0.0
-    servaddr->sin_port = htons(PORT);
+    if (inet_pton(AF_INET, serv_ip, &(servaddr->sin_addr)) <= 0) {
+        perror("Invalid address / Address not supported");
+        exit(EXIT_FAILURE);
+    }
+    servaddr->sin_port = htons(serv_port);
 
     return cli_sfd;
+}
+
+//-- Blocks until a message is received
+int
+receive_msg(int conn_fd, char *buff, size_t buffsize) 
+{
+    DEBUG_PRINTF("[CLIENT RECEIVING]\n");
+
+    // clear buffer and block until receiving a msg
+    memset(buff, 0, buffsize);
+    int bytes_received = recv(conn_fd, buff, buffsize, 0);
+    
+    if (bytes_received < 0) {
+        perror("recv failed");
+        return F_FAILURE;
+    }
+
+    // If 0-byte msg received it means the server closed the connection
+    if (bytes_received == 0) {
+        printf("Server closed the connection\n");
+        return F_SUCCESS;
+    }
+    
+    // null-terminate the msg and print it after the "+++" indicator
+    buff[bytes_received] = '\0';
+    printf("+++ %s", buff);
+    return bytes_received;
+}
+
+//-- Sends a message to the server
+int
+send_msg(int conn_fd, char *client_id)
+{
+    char msg[256];
+
+    snprintf(msg, sizeof(msg), "Hello server! From client %s\n", client_id);
+
+    if (send(conn_fd, msg, strlen(msg), 0) < 0) {
+        perror("send failed");
+        return F_FAILURE;
+    }
+    return F_SUCCESS;
 }
 
 //-- Wait with select() for the client file descriptor without "busy waiting"
@@ -81,114 +134,111 @@ wait_recv_timeout(fd_set *readmask, struct timeval *timeout)
 
     if (result == -1) {
         perror("select() failed");
-        return RECV_BREAK;
+        return WR_FAILURE;
     }
 
     // There IS data to read from the file descriptor
     if (FD_ISSET(cli_sfd, readmask)) {
         DEBUG_PRINTF(" `--> call recv()\n");
-        return RECV_SUCCESS;
+        return WR_SUCCESS;
     }
 
     // Timeout: no data found
     DEBUG_PRINTF(" `--> continue;\n");
-    return RECV_DOAGAIN;
+    return WR_NTR;
 }
 
-//-- Returns a status after receiving n bytes (with n being: int bytes_received)
+//-- Communication between client and server [HERE: client]
 int
-process_bytes_received(int bytes_received)
+connection_dialogue(char *client_id)
 {
-    if (bytes_received < 0) {
-        perror("recv failed");
-        return RECV_BREAK;
-    }
-
-    // In case the client receives a 0 byte msg, it means the server closed
-    if (bytes_received == 0) {
-        printf("Server closed the connection\n");
-        return RECV_BREAK;
-    }
-
-    return RECV_SUCCESS;
-}
-
-//-- Communication loop between client and server [HERE: client]
-void
-connection_dialogue(void)
-{
-    char input_buffer[1024], output_buffer[1024];
-    int bytes_received, recv_status;
+    char conn_buffer[1024];
+    int wait_recv_status, recv_status, exit_status = EXIT_FAILURE, listening = 1;
 
     fd_set readmask;
     struct timeval timeout_base;        // timeout to set each iteration
     struct timeval timer;               // timer the wait_recv..() function uses
 
-    timeout_base.tv_sec     = 0;             // seconds
-    timeout_base.tv_usec    = 500000;       // microseconds (0.5s = 500000)
+    // 2.1 second timeout (tries again after timeout)
+    timeout_base.tv_sec     = 2;
+    timeout_base.tv_usec    = 100000;
 
-    while (SOCKET_RUNNING) {
+    send_msg(cli_sfd, client_id);
+
+    while (listening) {
         
-        memset(output_buffer, 0, sizeof(output_buffer)); // clean output buffer
-
-        // Wait for the user to enter a message to send to the server
-        DEBUG_PRINTF("[client SENDING]\n");
-        printf("> ");
-        fgets(output_buffer, sizeof(output_buffer), stdin);
-
-        // Send the message
-        if (send(cli_sfd, output_buffer, strlen(output_buffer), 0) < 0) {
-            perror("send failed");
-            break;
-        }
-
         // do always before wait_recv (!)
         FD_ZERO(&readmask);             // Reset all deescriptors
         FD_SET(cli_sfd, &readmask);     // Asign client descriptor
-
-        DEBUG_PRINTF("[client RECEIVING with timeout %ld sec %ld micsec]\n",
-                        timeout_base.tv_sec, timeout_base.tv_usec);
-                        
-        // Set or reset the timer and call wait_recv..()
         timer = timeout_base;
-        recv_status = wait_recv_timeout(&readmask, &timer);
 
-        if (recv_status == RECV_DOAGAIN) {
+        wait_recv_status = wait_recv_timeout(&readmask, &timer);
+        if (wait_recv_status < 0) {
+            // If wait_recv_...() returned with FAILURE, end the listening loop
+            if (wait_recv_status == WR_FAILURE) {
+                listening = 0;
+            }
             continue;
         }
-        if (recv_status == RECV_BREAK) {
-            break;
+
+        // receive the msg
+        recv_status = receive_msg(cli_sfd, conn_buffer, sizeof(conn_buffer));
+
+        // after receiving 1 msg from the server, client terminates
+        listening = 0;
+        if(recv_status >= 0) {
+            exit_status = EXIT_SUCCESS;
         }
-
-        // Clean input buffer and receive the information from the server
-        memset(input_buffer, 0, sizeof(input_buffer));
-        bytes_received  = recv(cli_sfd, input_buffer, sizeof(input_buffer), 
-                                MSG_DONTWAIT);
-
-        // Process the status of the recv() call and break loop if necessary
-        recv_status     = process_bytes_received(bytes_received);
-        if(recv_status == RECV_BREAK) {
-            break;
-        }
-
-        // Print the message received with "+++ msg..." format
-        DEBUG_PRINTF("---- DATA RECEIVED FROM SERVER ----\n");
-        input_buffer[bytes_received] = '\0';
-        printf("+++ %s", input_buffer);
-        DEBUG_PRINTF("----------- END OF DATA -----------\n");
     }
+    return exit_status;
+}
+
+//-- terminates program after printing an error in case argnum is not correct
+void
+check_argnum(int argnum)
+{
+    if(argnum != 4) {
+        fprintf(stderr, "usage: ./client <client_id> <server_ip> <server_port>\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+//-- Tries to get the server port and convert it to int
+int
+try_get_port(char *str_port)
+{
+    char *endptr;
+    long int li_port;
+
+    // Get long int from str and look for possible failures (bad format)
+    li_port = strtol(str_port, &endptr, 10);
+    if (errno == ERANGE || *endptr != '\0') {
+        fprintf(stderr, "error: non-valid port (bad format)\n");
+        exit(EXIT_FAILURE);
+    }
+    return (int)li_port;
 }
 
 int
 main(int argc, char *argv[])
 {
+    int conn_exit_status, port;
     struct sockaddr_in servaddr;
+    char *client_id, *server_ip;
 
     // Disable buffering when printing messages
     setbuf(stdout, NULL);
 
+    check_argnum(argc);
+
+    port        = try_get_port(argv[3]);
+    client_id   = argv[1];
+    server_ip   = argv[2];
+
+    DEBUG_PRINTF("port is %i\n", port);
+
     // Create socket and set all proper configurations
-    init_client_socket(&servaddr);
+    init_client_socket(&servaddr, server_ip, port);
 
     // Signal management
     signal(SIGINT, handle_sigint);
@@ -200,11 +250,11 @@ main(int argc, char *argv[])
     printf("connected to the server...\n");
 
     // Communication (loop) : starts sending
-    connection_dialogue();
+    conn_exit_status = connection_dialogue(client_id);
 
     close(cli_sfd);
 
     DEBUG_PRINTF("Client file descriptor closed, terminating program\n");
-    exit(EXIT_SUCCESS);
+    exit(conn_exit_status);
 
 }

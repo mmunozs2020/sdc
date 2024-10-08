@@ -75,7 +75,10 @@ init_client_socket(struct sockaddr_in *servaddr)
     printf("Socket successfully created...\n");
 
     servaddr->sin_family = AF_INET;
-    servaddr->sin_addr.s_addr = htonl(INADDR_ANY);  // INADDR_ANY = 0.0.0.0
+    if (inet_pton(AF_INET, "127.0.0.1", &(servaddr->sin_addr)) <= 0) {
+        perror("Invalid address / Address not supported");
+        exit(EXIT_FAILURE);
+    }
     servaddr->sin_port = htons(PORT);
 
     return cli_sfd;

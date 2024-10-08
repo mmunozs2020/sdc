@@ -69,7 +69,7 @@ init_client_socket(struct sockaddr_in *servaddr)
     printf("Socket successfully created...\n");
 
     servaddr->sin_family = AF_INET;
-    servaddr->sin_addr.s_addr = htonl("212.128.255.24");  // # INADDR_ANY is 0.0.0.0 (all interfaces)
+    servaddr->sin_addr.s_addr = htonl(INADDR_ANY);  // # INADDR_ANY is 0.0.0.0 (all interfaces)
     servaddr->sin_port = htons(PORT);
 
     return cli_sfd;

@@ -1,0 +1,35 @@
+CC = gcc
+
+CFLAGS = -Wall -Wshadow -Wvla
+DFLAGS = -DDEBUG
+
+BIN_1 = P1
+BIN_2 = P2
+BIN_3 = P3
+
+stub: stub.c stub.h
+	$(CC) -c -o stub.o stub.h $(CFLAGS)
+
+# P1:
+uno: P1.c stub.o 
+	$(CC) -o $(BIN_1) P1.c stub.o $(CFLAGS)
+d-uno: P1.c stub.o 
+	$(CC) -o $(BIN_1) P1.c stub.o $(CFLAGS) $(DFLAGS)
+
+
+# P2:
+dos: P2.c stub.o 
+	$(CC) -o $(BIN_2) P2.c stub.o $(CFLAGS)
+d-dos: P2.c stub.o 
+	$(CC) -o $(BIN_2) P2.c stub.o $(CFLAGS) $(DFLAGS)
+
+
+# P3:
+tres: P3.c stub.o 
+	$(CC) -o $(BIN_3) P3.c stub.o $(CFLAGS)
+tres: P3.c stub.o 
+	$(CC) -o $(BIN_3) P3.c stub.o $(CFLAGS) $(DFLAGS)
+
+
+clean:
+	rm -f $(BIN_1) $(BIN_2) $(BIN_3)

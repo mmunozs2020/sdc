@@ -7,8 +7,16 @@ BIN_1 = P1
 BIN_2 = P2
 BIN_3 = P3
 
+
+all: stub uno dos tres
+
+
+# Stub
 stub: stub.c stub.h
 	$(CC) -c stub.c -o stub.o $(CFLAGS)
+d-stub: stub.c stub.h
+	$(CC) -c stub.c -o stub.o $(CFLAGS) $(DFLAGS)
+
 
 # P1:
 uno: P1.c stub.o 

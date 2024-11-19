@@ -9,6 +9,7 @@ BIN_SERV = server
 
 all: stub client server
 
+dall: d-stub d-client d-server
 
 # Stub
 stub: stub.c stub.h

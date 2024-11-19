@@ -36,7 +36,6 @@
 
 #define MAX_SERVER_THREADS  600
 #define MAX_BACKLOG         1024
-#define RW_BUFFER_SIZE      32  // buffer size to readers and writers
 
 #define WR_IN               2
 #define WR_OUT              -2
@@ -332,15 +331,15 @@ enum operations get_action_from_mode() {
 //-- converts an action to a readable string
 char *action_to_str(enum operations action) {
     if (action == READ) {
-        return "Lector";
+        return "READ";
     }
     if (action == WRITE) {
-        return "Escritor";
+        return "WRITE";
     }
-    return "Saboteador";
+    return "UNKNOWN OPERATION";
 }
 
-//-- returns the latency calculated from beginning to ending (in nanoseconds)
+//-- returns the latency calculated from beginning to ending
 long get_latency(const struct timespec *beginning, const struct timespec *ending) {
     long lat_sec = ending->tv_sec - beginning->tv_sec;
     long lat_nano = ending->tv_nsec - beginning->tv_nsec;
@@ -412,19 +411,16 @@ int receive_resp(int conn_fd, struct response *resp) {
 //-- function called from a server thread to read a protected value
 int do_read(int reader_id) {
     int loc_hc;
-    char rbuff[RW_BUFFER_SIZE];
+    char rbuff[32];
     FILE *server_output;
-    struct timespec now;
 
     pthread_mutex_lock(&rw_mutex);      // crit reader entrance -{
-    // wait if (there are writers inside OR there are writers waiting and they have priority)
-    while (writer_in != 0 || (writers_waiting > 0 && strcmp(serv_pri, "writer") == 0)) {
+    while (writer_in != 0) {    // wait until advertised if a writer is inside
         pthread_cond_wait(&r_cond, &rw_mutex);
     }
     readers_in++;
     pthread_mutex_unlock(&rw_mutex);    // }- crit reader entrance
 
-    // ## CRITICAL REGION ##
     server_output = fopen("server_output.txt" ,"r");        // READ -r-{
     if (fgets(rbuff, sizeof(rbuff), server_output) != NULL) {
         loc_hc = strtol(rbuff, NULL, 10);
@@ -432,37 +428,36 @@ int do_read(int reader_id) {
         loc_hc = -1;
     }
     fclose(server_output);                                  // }-r- READ
-    // ## EOCR ##
-    
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    fprintf(stdout, "[%li.%li][LECTOR %i] lee contador con valor %i\n", now.tv_sec, now.tv_nsec, reader_id, loc_hc);
+
+    // loc_hc = holy_counter;
+    fprintf(stdout, "[now][LECTOR %i] lee contador con valor %i\n", reader_id, loc_hc);
     usleep((rand() % (150000 - 75000 + 1)) + 75000);
 
-    pthread_mutex_lock(&rw_mutex);      // }- crit reader exit
+    pthread_mutex_lock(&rw_mutex);
     readers_in--;
-    if (readers_in == 0) {
+    // advertise to writers if (there are no more readers and (either priority is write or we have no readers waiting))
+    pthread_mutex_lock(&rwait_mutex);   // protect readers_waiting here also ---
+    if (readers_in == 0 && (readers_waiting == 0 || strcmp(serv_pri, "writer") == 0)) {
         pthread_cond_signal(&w_cond);
     }
-    pthread_mutex_unlock(&rw_mutex);    // }- crit reader entrance
+    pthread_mutex_unlock(&rwait_mutex); // ---
+    pthread_mutex_unlock(&rw_mutex);
     return loc_hc;
 }
 
 //-- function called from a server thread to overwrite a protected value
 int do_write(int writer_id) {
     int loc_hc;
-    char wbuff[RW_BUFFER_SIZE];
+    char wbuff[32];
     FILE *server_output;
-    struct timespec now;
 
     pthread_mutex_lock(&rw_mutex);      // crit writer entrance -{
-    // wait if (there are writers or readers inside OR there are readers waiting and they have priority)
-    while (writer_in != 0 || readers_in != 0 || (readers_waiting > 0 && strcmp(serv_pri, "reader") == 0)) {
+    while (writer_in != 0 || readers_in != 0) { // wait until there are neither readers nor writers
         pthread_cond_wait(&w_cond, &rw_mutex);
     }
     writer_in++;
     pthread_mutex_unlock(&rw_mutex);    // }- crit writer entrance
 
-    // ## CRITICAL REGION ##
     server_output = fopen("server_output.txt", "r+");       // WRITE -w-{
     if (fgets(wbuff, sizeof(wbuff), server_output) != NULL) {
         loc_hc = strtol(wbuff, NULL, 10);
@@ -472,46 +467,52 @@ int do_write(int writer_id) {
 
     loc_hc++;   // increment counter after reading it from file
     fseek(server_output, 0, SEEK_SET);
-    fprintf(server_output, "%d\n", loc_hc); // write loc_hc to server_output
+    fprintf(server_output, "%d\n", loc_hc);
     fclose(server_output);                                  // }-w- WRITE
-    // ## EOCR ##
 
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    fprintf(stdout, "[%li.%li][ESCRITOR #%i] modifica contador con valor %i\n", now.tv_sec, now.tv_nsec, writer_id, loc_hc);
+    // holy_counter++;
+    // loc_hc = holy_counter;
+    fprintf(stdout, "[now][ESCRITOR %i] modifica contador con valor %i\n", writer_id, loc_hc);
     usleep((rand() % (150000 - 75000 + 1)) + 75000);
 
-    pthread_mutex_lock(&rw_mutex);      // crit writer exit -{
+    pthread_mutex_lock(&rw_mutex);
     writer_in = 0;
-    pthread_cond_broadcast(&r_cond);
-    pthread_cond_signal(&w_cond);
-    pthread_mutex_unlock(&rw_mutex);    // }- crit writer exit
+    pthread_mutex_lock(&wwait_mutex);   // protect writers_waiting here also ---
+    if (writers_waiting == 0 || strcmp(serv_pri, "reader") == 0) {
+    pthread_cond_broadcast(&r_cond);        // advertise to readers if there are no writers waiting or priority is reader
+    } else {
+        pthread_cond_signal(&w_cond);       // advertise to writers otherwise
+    }
+    pthread_mutex_unlock(&wwait_mutex); // ---
+    pthread_mutex_unlock(&rw_mutex);
     return loc_hc;
 }
 
 //-- action determinates the waiter type (r/w) and io_wait the direction (to wait / to go)
 void waiting_room(enum operations action, int io) {
     if (action == READ) {
-        if (io == WR_IN) {              // reader enters the waiting room
+        if (io == WR_IN) {
             pthread_mutex_lock(&rwait_mutex);
             readers_waiting++;
             pthread_mutex_unlock(&rwait_mutex);
-        } else if (io == WR_OUT) {      // reader leaves the waiting room
+        } else if (io == WR_OUT) {
             pthread_mutex_lock(&rwait_mutex);
             readers_waiting--;
             pthread_mutex_unlock(&rwait_mutex);
         }
     } else if (action == WRITE) {
-        if (io == WR_IN) {              // writer enters the waiting room
+        if (io == WR_IN) {
             pthread_mutex_lock(&wwait_mutex);
             writers_waiting++;
             pthread_mutex_unlock(&wwait_mutex);
-        } else if (io == WR_OUT) {      // writer leaves the waiting room
+        } else if (io == WR_OUT) {
             pthread_mutex_lock(&wwait_mutex);
             writers_waiting--;
             pthread_mutex_unlock(&wwait_mutex);
         }
     }
 }
+
 
 //-- (server only!) closes the server socket and terminates with indicated status
 void terminate_server(int exit_status) {
@@ -531,7 +532,7 @@ int *server_handler() {
 
     while (sock_status == SOCKET_RUNNING) {
         sem_wait(&conn_sem);    // wait for a new connection
-        DEBUG_PRINTF("_> SEM POST RECEIVED: NEW CONNECTION\n");
+        DEBUG_PRINTF("_> SEM POST RECEIVED (<!css)\n");
 
         pthread_mutex_lock(&conn_mutex);    // protects conn_cfds[] and conn_index
         cci = conn_index - 1;
@@ -665,21 +666,21 @@ int config_servaddr(struct sockaddr_in *servaddr) {
 int *client_handler(struct client_data *cli_data) {
     int my_cfd = cli_data->conn_fd, recv_status;
     unsigned int my_id = cli_data->id;
-    struct request creq;
-    struct response cresp;
+    struct request req_msg;
+    struct response resp_msg;
 
     pthread_mutex_unlock(&clid_mutex);
 
-    creq = create_req(get_action_from_mode(), my_id);    
-    send_req_through(my_cfd, &creq);
+    req_msg = create_req(get_action_from_mode(), my_id);    
+    send_req_through(my_cfd, &req_msg);
 
-    cresp = create_empty_resp();
-    recv_status = receive_resp(my_cfd, &cresp);
+    resp_msg = create_empty_resp();
+    recv_status = receive_resp(my_cfd, &resp_msg);
     while (recv_status != F_SUCCESS) {
-        recv_status = receive_resp(my_cfd, &cresp);
+        recv_status = receive_resp(my_cfd, &resp_msg);
     }
 
-    fprintf(stdout, "[Cliente #%i] %s, contador=%i, tiempo=%ld ns\n", my_id, action_to_str(creq.action), cresp.counter, cresp.latency_time);
+    fprintf(stdout, "response to <%i> report [%i // %ld]\n", my_id, resp_msg.counter, resp_msg.latency_time);
 
     close(my_cfd);
     return NULL;
@@ -747,3 +748,4 @@ void start_up_client(int argc, char *argv[]) {
 
     terminate_client(EXIT_SUCCESS);
 }
+

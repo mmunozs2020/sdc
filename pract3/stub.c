@@ -185,18 +185,14 @@ int get_serv_args(int argc, char **argv) {
     int op;
     int index = 0;
     struct option serv_options[] = {
-        {"ip",          required_argument, 0, 'i'},
         {"port",        required_argument, 0, 'p'},
         {"priority",    required_argument, 0, 'q'},
         {0, 0, 0, 0}
     };  // Required server arguments (ip, port and priority)
 
     // Parse through all possible options 
-    while ((op = getopt_long(argc, argv, "i:p:q:", serv_options, &index)) != -1) {
+    while ((op = getopt_long(argc, argv, "p:q:", serv_options, &index)) != -1) {
         switch (op) {
-            case 'i':
-                ip = strdup(optarg);
-                break;
             case 'p':
                 port = get_int_from_char(optarg);
                 break;
@@ -205,7 +201,7 @@ int get_serv_args(int argc, char **argv) {
                 break;
             default:
                 fprintf(stderr, 
-                        "usage: %s --ip IP --port PORT --mode writer/reader --threads 100\n", argv[0]);
+                        "usage: %s --port PORT --priority writer/reader\n", argv[0]);
                 return F_FAILURE;
         }
     }
@@ -226,21 +222,13 @@ void free_args() {
 
 
 //-- starts up a new socket, returns its fd when success, F_FAILURE otherwise
-int init_socket(struct sockaddr_in *servaddr, char *serv_ip, int serv_port) {
+int init_socket(struct sockaddr_in *servaddr, int serv_port) {
     int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
 
     if (sock_fd < 0) {
         perror_msg("Error creating socket", sock_fd, SOCKET_CLOSED);
         return F_FAILURE;
     }
-
-    // port and IP configuration for the socket
-    servaddr->sin_family = AF_INET;
-    if (inet_pton(AF_INET, serv_ip, &(servaddr->sin_addr)) <= 0) {
-        perror_msg_sr("Invalid address / Address not supported", sock_fd);
-        return F_FAILURE;
-    }
-    servaddr->sin_port = htons(serv_port);
 
     // sock_status is set to SOCKET_RUNNING when success
     sock_status = SOCKET_RUNNING;
@@ -618,13 +606,17 @@ void start_up_server(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    sock_sfd = init_socket(&servaddr, ip, port); // establishes sock_sfd
+    sock_sfd = init_socket(&servaddr, port); // establishes sock_sfd
     if (sock_sfd == F_FAILURE) {
         sock_status = SOCKET_CLOSED;
         exit(EXIT_FAILURE);
     }
 
     enable_setsockopt(sock_sfd);
+
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    servaddr.sin_port = htons(port);
 
     if (bind_and_listen(sock_sfd, &servaddr) == F_FAILURE) {
         close(sock_sfd);
